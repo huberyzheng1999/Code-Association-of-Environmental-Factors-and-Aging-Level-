@@ -1,0 +1,133 @@
+import pandas as pd
+
+# 11111111111111111111111把所有数据quyu2019y_0131.csv随机分为90%的“train1_0206.csv”和10%的”test1_0206”
+# 读取所有有站点数据的参数集
+f_grid = open(r"quyu2019y_0131.csv", 'rb')
+pm = pd.read_csv(f_grid, encoding="utf_8_sig", low_memory=False)
+
+# 随机分为90%和10%十折交叉验证
+df = pm.sample(frac=0.9, replace=False)
+df_1 = pm[~pm.index.isin(df.index)]
+print(pm.describe())
+
+df.to_csv(r'train1_0206.csv', encoding="utf_8_sig", mode='w+')
+df_1.to_csv(r'test1_0206.csv', encoding="utf_8_sig", mode='w+')
+# 22222222222222222222222
+import os
+
+order = 'python main.py \
+       --root F:\\PM2.5\\PM2.5\\SOP\\3.goujian\\ubantu_code\
+       --filename train1_0206\
+       --chose_label Leq \
+       --chose_feature dem gdp night_light pop ndvi road_0 road_1 road_2 road_3 road_4 road_5 road_6 landuse_11 landuse_22 landuse_23 landuse_24 landuse_31 landuse_32 landuse_33 landuse_41 landuse_42 landuse_43 landuse_46 landuse_51 landuse_52 landuse_53 landuse_64 landuse_65 landuse_66 poi_bus poi_rail poi_park poi_food poi_school poi_zonghehos poi_zhuankehos road0_dis road1_dis road2_dis road3_dis road4_dis road5_dis road6_dis pm2.5 aqi so2 no2 o3 co\
+       --if_save_model True \
+      '
+##root是路径，filename是第1步生成的训练集，Leq是因变量Y，dem/gdp...是自变量，注意规范命名
+
+os.system(order)
+# coding=utf-8
+from sklearn.metrics import r2_score
+from sklearn.metrics import mean_squared_error
+from sklearn.metrics import mean_absolute_error
+import numpy as np
+import pandas as pd
+import joblib
+from matplotlib.colors import LogNorm
+import pandas as pd
+from scipy import optimize
+import matplotlib
+import matplotlib.pyplot as plt
+
+# 333333333333333333333333333333333333读取测试集"test1_0206.csv"
+# f = open (r"rr\rr_t.csv",'rb')
+f = open(r"test1_0206.csv", 'rb')
+test = pd.read_csv(f)
+test = test.fillna(0)
+
+# 444444444444444444444444444444444444'train1_0206_RF.pkl'文件是第2步会生成的测试集文件
+# f = open(r'rr\rr_train_var_date1_RF.pkl', 'rb')
+f = open(r'train1_0206_RF.pkl', 'rb')
+r = joblib.load(f)
+f.close()
+test_set = test.loc[:,
+           ['dem', 'gdp', 'night_light', 'pop', 'ndvi', 'road_0', 'road_1', 'road_2', 'road_3', 'road_4', 'road_5',
+            'road_6', 'landuse_11', 'landuse_22', 'landuse_23', 'landuse_24', 'landuse_31', 'landuse_32', 'landuse_33',
+            'landuse_41', 'landuse_42', 'landuse_43', 'landuse_46', 'landuse_51', 'landuse_52', 'landuse_53',
+            'landuse_64', 'landuse_65', 'landuse_66', 'poi_bus', 'poi_rail', 'poi_park', 'poi_food', 'poi_school',
+            'poi_zonghehos', 'poi_zhuankehos', 'road0_dis', 'road1_dis', 'road2_dis', 'road3_dis', 'road4_dis',
+            'road5_dis', 'road6_dis', 'pm2.5', 'pm10', 'so2', 'no2', 'o3', 'co']]
+# 自变量
+print(type(test_set))
+result = r.predict(test_set.values)
+y_result = pd.DataFrame(result)
+print(y_result)
+
+# 5555555555555555555555555555555555555555生成'test1_0206res.csv'文件，
+import pandas as pd
+
+import numpy as np
+
+import matplotlib.pyplot as plt
+
+from scipy.optimize import curve_fit
+
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+
+# Load data
+
+test = pd.read_csv('test10_201065res.csv', encoding="utf_8_sig", index_col=None)
+
+
+# Define function
+
+def f(x, A, B):
+    return A * x + B
+
+
+# Data preparation
+
+x_data = np.array(test['liuwu']).reshape(len(test['liuwu']), )
+
+y_result = np.array(y_result).reshape(len(a), )
+
+# Histogram 2D plot
+
+_, _, _, C = plt.hist2d(x_data, y_result, bins=30, cmap=plt.cm.jet, norm=LogNorm(vmin=1, vmax=10))
+
+plt.colorbar(C)
+
+# Curve fitting
+
+popt, _ = curve_fit(f, x_data, y_result)
+
+x_fit = np.linspace(0, 20, 100)
+
+y_fit = f(x_fit, *popt)
+
+# Plotting
+
+plt.plot(x_fit, y_fit, "black")
+
+plt.plot(x_fit, x_fit, "black", linestyle='--')
+
+plt.text(13, 4, "y = " + str(round(popt[0], 2)) + "x + " + str(round(popt[1], 2)),
+         fontdict={'size': 12, 'color': 'black'})
+
+plt.text(13, 1, "test - $R^2$ = " + str(round(r2_score(x_data, y_result), 2)), fontdict={'size': 12, 'color': 'black'})
+
+plt.xlim(0, 20)
+
+plt.ylim(0, 20)
+
+plt.ylabel("Fitted")
+
+plt.xlabel("Observed")
+
+plt.savefig(r'test8_201065.png', dpi=300)
+
+plt.close()
+
+plt.clf()
+
+print("R2: ", round(r2_score(a, b), 2), "MSE:", round(mean_squared_error(a, b), 2), "MAE:",
+      round(mean_absolute_error(a, b), 2))
