@@ -1,0 +1,120 @@
+import pandas as pd
+import numpy as np
+import warnings
+warnings.filterwarnings('ignore')  
+
+def load_and_prepare_data(file_path):
+     df = pd.read_excel(file_path)
+
+    independent_vars = [
+        'GDP',……
+    ]
+    panel_id = 'pac'        
+    time_col = 'Year'  
+    group_col = 'Urb'      
+    target_vars = ['LA65', 'LA85']  
+
+    df[panel_id] = df[panel_id].astype(str)  
+    df[time_col] = df[time_col].astype(int)  
+    drop_na_cols = independent_vars + target_vars + [panel_id, time_col, group_col]
+    df = df.dropna(subset=drop_na_cols)
+
+    df['Urb_Group'] = pd.cut(
+        df[group_col],
+        bins=[-1, 3, 7, 10],
+        labels=['低城市化组', '中城市化组', '高城市化组']
+    )
+
+    df_panel = df.set_index([panel_id, time_col])
+
+    return df_panel, independent_vars, target_vars
+
+def analyze_la65_la85_corr(df_panel):
+    la_corr_results = {}
+
+    for group_name in ['低城市化组', '中城市化组', '高城市化组']:
+        group_data = df_panel[df_panel['Urb_Group'] == group_name].copy()
+
+        if len(group_data) < 5:
+            print(f"  警告：{group_name}（LA65-LA85）样本量不足（{len(group_data)}），跳过相关性分析")
+            continue
+
+        la_overall_corr = group_data[['LA65', 'LA85']].corr().round(3)
+
+        sheet_name_overall = f'LA65_LA85_{group_name}_整体相关'
+        la_corr_results[sheet_name_overall] = la_overall_corr
+        print(f"  完成：{group_name} LA65-LA85 整体相关（相关系数：{la_overall_corr.loc['LA65', 'LA85']}）")
+
+        la_county_mean = group_data[['LA65', 'LA85']].groupby(level=0).transform('mean')  
+        la_within_residual = group_data[['LA65', 'LA85']] - la_county_mean
+        la_within_corr = la_within_residual.corr().round(3)
+        sheet_name_within = f'LA65_LA85_{group_name}_组内相关'
+        la_corr_results[sheet_name_within] = la_within_corr
+        print(f"  完成：{group_name} LA65-LA85 组内相关（相关系数：{la_within_corr.loc['LA65', 'LA85']}）")
+
+    return la_corr_results
+
+def analyze_target_independent_corr(df_panel, independent_vars, target_vars):
+
+    target_corr_results = {}  
+
+    for target in target_vars:
+        print(f"\n  正在分析因变量：{target}")
+        for group_name in ['低城市化组', '中城市化组', '高城市化组']:
+            group_data = df_panel[df_panel['Urb_Group'] == group_name].copy()
+            if len(group_data) < 5:
+                print(f"  警告：{group_name}（{target}）样本量不足（{len(group_data)}），跳过相关性分析")
+                continue
+
+            analysis_vars = [target] + independent_vars
+
+            overall_corr = group_data[analysis_vars].corr().round(3)
+            sheet_name = f'{target}_{group_name}_整体相关'
+            target_corr_results[sheet_name] = overall_corr
+            print(f"  完成：{group_name} {target} 整体相关（共{len(independent_vars)}个自变量）")
+
+            county_mean = group_data[analysis_vars].groupby(level=0).transform('mean') 
+            within_residual = group_data[analysis_vars] - county_mean
+            within_corr = within_residual.corr().round(3)
+            sheet_name = f'{target}_{group_name}_组内相关'
+            target_corr_results[sheet_name] = within_corr
+            print(f"  完成：{group_name} {target} 组内相关（共{len(independent_vars)}个自变量）")
+
+    return target_corr_results
+
+def main(file_path, save_dir):
+
+    print("=== 1. 开始数据预处理 ===")
+    df_panel, independent_vars, target_vars = load_and_prepare_data(file_path)
+    print(f"数据预处理完成！")
+    print(f"- 面板数据维度：{df_panel.shape}")
+    print(f"- 自变量列表：{independent_vars}")
+    print(f"- 因变量列表：{target_vars}")
+
+    la_corr_results = analyze_la65_la85_corr(df_panel)
+
+    target_indep_corr_results = analyze_target_independent_corr(df_panel, independent_vars, target_vars)
+
+    all_corr_results = {**la_corr_results, **target_indep_corr_results}  
+
+    print("\n=== 3. 整合所有结果到Excel ===")
+    excel_path = f'{save_dir}/县域面板数据_全相关性结果.xlsx'
+    with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+        for sheet_name, corr_matrix in all_corr_results.items():
+            corr_matrix.to_excel(writer, sheet_name=sheet_name)
+
+    print(f"\n=== 所有分析完成！===")
+    print(f"Excel结果文件已保存至：{excel_path}")
+    print(f"\nExcel包含以下类型的sheet：")
+    print(f"1. LA65_LA85_XXX_整体相关：LA65与LA85在XXX城市化组的整体相关性")
+    print(f"2. LA65_LA85_XXX_组内相关：LA65与LA85在XXX城市化组的组内相关性")
+    print(f"3. LA65_XXX_整体相关：LA65与自变量在XXX城市化组的整体相关性")
+    print(f"4. LA65_XXX_组内相关：LA65与自变量在XXX城市化组的组内相关性")
+    print(f"5. LA85_XXX_整体相关：LA85与自变量在XXX城市化组的整体相关性")
+    print(f"6. LA85_XXX_组内相关：LA85与自变量在XXX城市化组的组内相关性")
+
+if __name__ == '__main__':
+    DATA_FILE_PATH = 'C:/……'  
+    SAVE_DIRECTORY = 'C:/……'
+
+    main(file_path=DATA_FILE_PATH, save_dir=SAVE_DIRECTORY)
