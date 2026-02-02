@@ -1,0 +1,259 @@
+import pandas as pd
+import numpy as np
+from linearmodels import PanelOLS
+import statsmodels.api as sm
+import warnings
+from linearmodels.panel.results import compare
+
+warnings.filterwarnings('ignore')
+
+# 路径配置
+DATA_PATH = 'C:/……'
+RESULT_PATH = 'C:/……'
+
+SELECTED_VARS = {
+    "低城市化组": {
+        "LA65": [……],
+        "LA85": [……]
+    },
+    "中城市化组": {
+        "LA65": [……],
+        "LA85": [……]
+    },
+    "高城市化组": {
+        "LA65": [……],
+        "LA85": [……]
+    }
+}
+
+
+def create_urbanization_groups(df):
+    df = df.copy()
+    df['Urbanization_Group'] = '高城市化组' 
+    df.loc[df['Urb'] < 4, 'Urbanization_Group'] = '低城市化组'
+    df.loc[(df['Urb'] >= 4) & (df['Urb'] <= 7), 'Urbanization_Group'] = '中城市化组'
+    return df
+
+
+def run_different_effects_models(df, group_name, dep_var, indep_vars):
+    results_dict = {}
+
+    variables = ['pac', 'Year', dep_var] + indep_vars
+    df_subset = df[variables].dropna()
+
+    if len(df_subset) < 20:
+        print(f"    样本量不足 ({len(df_subset)})，跳过回归")
+        return None
+
+    df_subset = df_subset.set_index(['pac', 'Year'])
+
+    y = df_subset[dep_var]
+    X = df_subset[indep_vars]
+
+    X = sm.add_constant(X)
+
+    try:
+        model_entity = PanelOLS(y, X, entity_effects=True, time_effects=False)
+        results_entity = model_entity.fit(cov_type='robust')
+        results_dict['个体效应'] = results_entity
+
+        model_time = PanelOLS(y, X, entity_effects=False, time_effects=True)
+        results_time = model_time.fit(cov_type='robust')
+        results_dict['时间效应'] = results_time
+
+        model_both = PanelOLS(y, X, entity_effects=True, time_effects=True)
+        results_both = model_both.fit(cov_type='robust')
+        results_dict['双向固定'] = results_both
+
+        return results_dict
+
+    except Exception as e:
+        print(f"    模型估计失败: {str(e)[:100]}...")
+        return None
+
+
+def extract_model_summary(results_dict, group_name, dep_var):
+
+    summary_list = []
+
+    for model_name, results in results_dict.items():
+        coef_df = results.params.reset_index()
+        coef_df.columns = ['Variable', 'Coefficient']
+
+        se_df = results.std_errors.reset_index()
+        se_df.columns = ['Variable', 'Std_Error']
+
+        pval_df = results.pvalues.reset_index()
+        pval_df.columns = ['Variable', 'P_Value']
+
+        result_df = pd.merge(coef_df, se_df, on='Variable')
+        result_df = pd.merge(result_df, pval_df, on='Variable')
+
+        def add_star(p):
+            if p < 0.01:
+                return '***'
+            elif p < 0.05:
+                return '**'
+            elif p < 0.1:
+                return '*'
+            else:
+                return ''
+
+        result_df['Significance'] = result_df['P_Value'].apply(add_star)
+
+        result_df['Group'] = group_name
+        result_df['Dependent_Variable'] = dep_var
+        result_df['Model_Type'] = model_name
+        result_df['N_obs'] = results.nobs
+        result_df['R_squared'] = results.rsquared
+        result_df['R_squared_within'] = results.rsquared_within if hasattr(results,
+                                                                           'rsquared_within') else results.rsquared
+
+        if hasattr(results, 'f_statistic') and hasattr(results.f_statistic, 'stat'):
+            result_df['F_statistic'] = results.f_statistic.stat
+            result_df['F_pvalue'] = results.f_statistic.pval
+        else:
+            result_df['F_statistic'] = None
+            result_df['F_pvalue'] = None
+
+        summary_list.append(result_df)
+
+    return pd.concat(summary_list, ignore_index=True)
+
+
+def compare_models(models_dict):
+    comparison_data = []
+
+    for model_name, results in models_dict.items():
+        comparison_data.append({
+            '模型类型': model_name,
+            '观测值': results.nobs,
+            'R²': results.rsquared,
+            '组内R²': results.rsquared_within if hasattr(results, 'rsquared_within') else results.rsquared,
+            'F统计量': results.f_statistic.stat if hasattr(results.f_statistic, 'stat') else None,
+            'F统计量p值': results.f_statistic.pval if hasattr(results.f_statistic, 'pval') else None
+        })
+
+    return pd.DataFrame(comparison_data)
+
+
+def main():
+    print("正在读取数据...")
+    df = pd.read_excel(DATA_PATH)
+
+    print(f"数据形状: {df.shape}")
+    print(f"变量数量: {len(df.columns)}")
+    years = sorted(df['Year'].unique())
+    print(f"时间跨度: {years} (共{len(years)}期)")
+    print(f"地区数量: {df['pac'].nunique()}")
+
+    df = create_urbanization_groups(df)
+
+    print("\n检查面板数据结构:")
+    year_counts = df.groupby('pac')['Year'].nunique()
+    print(f"平衡面板地区数: {(year_counts == len(years)).sum()}")
+    print(f"非平衡面板地区数: {(year_counts < len(years)).sum()}")
+
+    with pd.ExcelWriter(RESULT_PATH, engine='openpyxl') as writer:
+        all_results = []
+        all_comparisons = []
+
+        for group_name in ['低城市化组', '中城市化组', '高城市化组']:
+            print(f"\n{'=' * 60}")
+            print(f"处理分组: {group_name}")
+            print(f"{'=' * 60}")
+
+            group_df = df[df['Urbanization_Group'] == group_name].copy()
+
+            print(f"样本量: {len(group_df)}")
+            print(f"地区数量: {group_df['pac'].nunique()}")
+            print(f"年份分布:\n{group_df['Year'].value_counts().sort_index()}")
+
+            for dep_var in ['LA65', 'LA85']:
+                print(f"\n因变量: {dep_var}")
+
+                indep_vars = SELECTED_VARS[group_name][dep_var]
+
+                missing_vars = [var for var in indep_vars if var not in df.columns]
+                if missing_vars:
+                    print(f"  警告: 以下变量不存在: {missing_vars}")
+                    indep_vars = [var for var in indep_vars if var in df.columns]
+
+                print(f"  自变量: {indep_vars}")
+
+                results_dict = run_different_effects_models(group_df, group_name, dep_var, indep_vars)
+
+                if results_dict is not None:
+                    model_results_df = extract_model_summary(results_dict, group_name, dep_var)
+
+                    all_results.append(model_results_df)
+
+                    comparison_df = compare_models(results_dict)
+                    comparison_df['Group'] = group_name
+                    comparison_df['Dependent_Variable'] = dep_var
+                    all_comparisons.append(comparison_df)
+
+                    print(f"  模型比较:")
+                    for _, row in comparison_df.iterrows():
+                        print(
+                            f"    {row['模型类型']}: R²={row['R²']:.3f}, 组内R²={row['组内R²']:.3f}, N={row['观测值']}")
+
+                    for model_type in ['个体效应', '时间效应', '双向固定']:
+                        if model_type in results_dict:
+                            model_df = model_results_df[model_results_df['Model_Type'] == model_type].copy()
+
+                            sheet_name = f"{group_name[:6]}_{dep_var}_{model_type[:2]}"
+                            sheet_name = sheet_name[:31]  
+                            model_df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+                    print(f"  回归完成，结果已保存")
+                else:
+                    print(f"  回归失败")
+
+        if all_results:
+            summary_df = pd.concat(all_results, ignore_index=True)
+            summary_df.to_excel(writer, sheet_name='所有模型汇总', index=False)
+
+            if all_comparisons:
+                comparison_summary = pd.concat(all_comparisons, ignore_index=True)
+                comparison_summary.to_excel(writer, sheet_name='模型比较', index=False)
+
+                print(f"\n{'=' * 60}")
+                print("模型类型选择建议:")
+                print(f"{'=' * 60}")
+
+                for group_name in ['低城市化组', '中城市化组', '高城市化组']:
+                    group_comparison = comparison_summary[comparison_summary['Group'] == group_name]
+                    print(f"\n{group_name}:")
+
+                    for dep_var in ['LA65', 'LA85']:
+                        dep_comparison = group_comparison[group_comparison['Dependent_Variable'] == dep_var]
+                        best_model = dep_comparison.loc[dep_comparison['R²'].idxmax()]
+                        print(f"  {dep_var}: 建议使用{best_model['模型类型']}模型 (R²最高: {best_model['R²']:.3f})")
+
+        group_stats = df.groupby('Urbanization_Group').agg({
+            'pac': 'nunique',
+            'Year': lambda x: sorted(x.unique())
+        }).reset_index()
+        group_stats.columns = ['Urbanization_Group', 'N_Regions', 'Years']
+        group_stats.to_excel(writer, sheet_name='分组统计', index=False)
+
+        panel_info = pd.DataFrame({
+            '特征': ['总观测值', '地区数量', '时间期数', '平均每地区观测值', '面板类型'],
+            '数值': [len(df), df['pac'].nunique(), len(years),
+                     len(df) / df['pac'].nunique(),
+                     '平衡面板' if (year_counts == len(years)).all() else '非平衡面板']
+        })
+        panel_info.to_excel(writer, sheet_name='面板数据特征', index=False)
+
+    print(f"\n分析完成！结果已保存至: {RESULT_PATH}")
+    print(f"{'=' * 60}")
+    print("模型选择建议:")
+    print("1. 如果您只有2期数据（如2010和2020年），建议使用'个体效应'模型")
+    print("2. 如果时间效应不显著，也建议使用'个体效应'模型")
+    print("3. '双向固定'模型适合多期数据且存在明显时间趋势的情况")
+    print("4. 在Excel的'模型比较'工作表中查看各模型的R²对比")
+
+
+if __name__ == "__main__":
+    main()

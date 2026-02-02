@@ -1,0 +1,476 @@
+import pandas as pd
+import numpy as np
+from linearmodels import PanelOLS
+import statsmodels.api as sm
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+import warnings
+
+warnings.filterwarnings('ignore')
+
+DATA_PATH = 'C:/……'
+RESULT_PATH = 'C:/……'
+
+SELECTED_VARS = {
+    "低城市化组": {
+        "LA65": [……],
+        "LA85": [……]
+    },
+    "中城市化组": {
+        "LA65": [……],
+        "LA85": [……]
+    },
+    "高城市化组": {
+        "LA65": [……],
+        "LA85": [……]
+    }
+}
+
+
+def check_vif_without_time(df, indep_vars):
+
+    vars_to_check = [var for var in indep_vars if var in df.columns]
+    df_check = df[vars_to_check].dropna()
+
+    if len(df_check) < 10:
+        print("    样本量太少，无法进行VIF检验")
+        return {}, []
+
+    X = sm.add_constant(df_check)
+
+    vif_data = pd.DataFrame()
+    vif_data["Variable"] = X.columns
+    vif_data["VIF"] = [variance_inflation_factor(X.values, i) for i in range(X.shape[1])]
+
+    vif_data = vif_data[vif_data['Variable'] != 'const']
+
+    print("  VIF值:")
+    for _, row in vif_data.iterrows():
+        print(f"    {row['Variable']}: {row['VIF']:.2f}")
+
+    high_vif_vars = vif_data[vif_data['VIF'] > 10]['Variable'].tolist()
+
+    if high_vif_vars:
+        print(f"  ⚠️ 以下变量VIF > 10，可能存在严重共线性: {high_vif_vars}")
+
+        corr_matrix = df_check.corr().abs()
+
+        removal_suggestions = []
+        for var in high_vif_vars:
+
+            corr_with_var = corr_matrix[var].drop(var)
+            if not corr_with_var.empty:
+                max_corr_var = corr_with_var.idxmax()
+                max_corr = corr_with_var.max()
+                print(f"    {var}与{max_corr_var}的相关性最高: {max_corr:.3f}")
+                removal_suggestions.append(var)
+
+        return vif_data, removal_suggestions
+    else:
+        print("  ✅ 所有变量VIF ≤ 10，共线性问题不严重")
+        return vif_data, []
+
+
+def create_urbanization_groups(df):
+
+    df = df.copy()
+    df['Urbanization_Group'] = '高城市化组'  
+    df.loc[df['Urb'] < 4, 'Urbanization_Group'] = '低城市化组'
+    df.loc[(df['Urb'] >= 4) & (df['Urb'] <= 7), 'Urbanization_Group'] = '中城市化组'
+    return df
+
+
+def prepare_time_trend_variable(df):
+
+    df = df.copy()
+
+    unique_years = sorted(df['Year'].unique())
+
+    if len(unique_years) != 2:
+        print(f"警告: 期望2个年份，但找到{len(unique_years)}个")
+        return df, False
+
+    # 创建简单的时间趋势变量：较早年份=0，较晚年份=1
+    year_mapping = {unique_years[0]: 0, unique_years[1]: 1}
+    df['time_trend'] = df['Year'].map(year_mapping)
+
+    print(f"时间趋势变量创建:")
+    print(f"  {unique_years[0]} -> time_trend = 0")
+    print(f"  {unique_years[1]} -> time_trend = 1")
+
+    return df, True
+
+
+def run_entity_effects_with_time_trend(df, group_name, dep_var, indep_vars):
+
+    try:
+        extended_indep_vars = indep_vars.copy()
+        extended_indep_vars.append('time_trend')
+
+        variables = list(set(['pac', 'Year', dep_var] + extended_indep_vars))
+        df_subset = df[variables].dropna()
+
+        if df_subset['time_trend'].nunique() < 2:
+            print(f"    警告: 时间趋势变量没有变化，跳过")
+            return None, None
+
+        if len(df_subset) < 20:
+            print(f"    样本量不足 ({len(df_subset)})，跳过回归")
+            return None, None
+
+        df_subset = df_subset.set_index(['pac', 'Year'])
+
+        y = df_subset[dep_var]
+        X = df_subset[extended_indep_vars]
+
+        X = sm.add_constant(X)
+
+        model = PanelOLS(y, X, entity_effects=True, time_effects=False)
+        results = model.fit(cov_type='robust')
+
+        return results, extended_indep_vars
+    except Exception as e:
+        print(f"    模型估计失败: {str(e)[:100]}")
+        return None, None
+
+
+def run_first_difference_model(df, group_name, dep_var, indep_vars):
+
+    try:
+
+        years = sorted(df['Year'].unique())
+        if len(years) != 2:
+            print(f"    需要恰好2个年份，但找到{len(years)}个")
+            return None
+
+        variables = ['pac', 'Year', dep_var] + indep_vars
+        df_subset = df[variables].dropna()
+
+        df_subset = df_subset.sort_values(['pac', 'Year'])
+
+        diff_data = []
+
+        for pac, group in df_subset.groupby('pac'):
+            if len(group) == 2:  
+                group = group.sort_values('Year')
+
+                diff_y = group[dep_var].iloc[1] - group[dep_var].iloc[0]
+
+                diff_row = {'pac': pac, f'diff_{dep_var}': diff_y}
+                for var in indep_vars:
+                    diff_row[f'diff_{var}'] = group[var].iloc[1] - group[var].iloc[0]
+
+                diff_data.append(diff_row)
+
+        if not diff_data:
+            print(f"    没有足够的差分数据")
+            return None
+
+        diff_df = pd.DataFrame(diff_data)
+
+        if len(diff_df) < 10:
+            print(f"    差分样本量不足 ({len(diff_df)})")
+            return None
+
+        y = diff_df[f'diff_{dep_var}']
+        X_vars = [f'diff_{var}' for var in indep_vars]
+        X = diff_df[X_vars]
+
+        X = sm.add_constant(X)
+
+        model = sm.OLS(y, X)
+        results = model.fit(cov_type='HC3')
+
+        class DiffResults:
+            def __init__(self, sm_results, nobs):
+                self.params = sm_results.params
+                self.std_errors = sm_results.bse
+                self.pvalues = sm_results.pvalues
+                self.nobs = nobs
+                self.rsquared = sm_results.rsquared
+                # 一阶差分模型没有组内R²，设为相同值
+                self.rsquared_within = sm_results.rsquared
+                self.f_statistic = type('obj', (object,), {
+                    'stat': sm_results.fvalue,
+                    'pval': sm_results.f_pvalue
+                })
+
+        return DiffResults(results, len(diff_df))
+    except Exception as e:
+        print(f"    一阶差分模型失败: {str(e)[:100]}")
+        return None
+
+
+def format_results_summary(model_results, model_type, group_name, dep_var):
+
+    if model_results is None:
+        return None
+
+    coef_df = model_results.params.reset_index()
+    coef_df.columns = ['Variable', 'Coefficient']
+
+    se_df = model_results.std_errors.reset_index()
+    se_df.columns = ['Variable', 'Std_Error']
+
+    pval_df = model_results.pvalues.reset_index()
+    pval_df.columns = ['Variable', 'P_Value']
+
+    result_df = pd.merge(coef_df, se_df, on='Variable')
+    result_df = pd.merge(result_df, pval_df, on='Variable')
+
+    def add_star(p):
+        if p < 0.01:
+            return '***'
+        elif p < 0.05:
+            return '**'
+        elif p < 0.1:
+            return '*'
+        else:
+            return ''
+
+    result_df['Significance'] = result_df['P_Value'].apply(add_star)
+
+    result_df['Group'] = group_name
+    result_df['Dependent_Variable'] = dep_var
+    result_df['Model_Type'] = model_type
+    result_df['N_obs'] = model_results.nobs
+    result_df['R_squared'] = model_results.rsquared
+    result_df['R_squared_within'] = model_results.rsquared_within
+
+    if hasattr(model_results, 'f_statistic') and hasattr(model_results.f_statistic, 'stat'):
+        result_df['F_statistic'] = model_results.f_statistic.stat
+        result_df['F_pvalue'] = model_results.f_statistic.pval
+    else:
+        result_df['F_statistic'] = None
+        result_df['F_pvalue'] = None
+
+    return result_df
+
+
+def main():
+
+    print("正在读取数据...")
+    df = pd.read_excel(DATA_PATH)
+
+    print(f"数据形状: {df.shape}")
+    print(f"变量数量: {len(df.columns)}")
+
+    years = sorted(df['Year'].unique())
+    print(f"时间跨度: {years} (共{len(years)}期)")
+
+    if len(years) < 2:
+        print("❌ 错误: 数据少于2个年份，无法进行面板数据分析！")
+        return
+
+    elif len(years) == 2:
+        print("ℹ️ 数据只有2个年份，使用个体效应+时间趋势模型")
+        print("   一阶差分模型作为稳健性检验")
+
+    else:
+        print(f"ℹ️ 数据有{len(years)}个年份")
+        print("   但仍建议使用个体效应+时间趋势或双向固定效应")
+
+    print(f"地区数量: {df['pac'].nunique()}")
+
+    df = create_urbanization_groups(df)
+
+    df, can_proceed = prepare_time_trend_variable(df)
+
+    if not can_proceed:
+        return
+
+    with pd.ExcelWriter(RESULT_PATH, engine='openpyxl') as writer:
+        all_results = []
+        model_comparisons = []
+        vif_results = []
+
+        for group_name in ['低城市化组', '中城市化组', '高城市化组']:
+            print(f"\n{'=' * 60}")
+            print(f"处理分组: {group_name}")
+            print(f"{'=' * 60}")
+
+            group_df = df[df['Urbanization_Group'] == group_name].copy()
+
+            print(f"样本量: {len(group_df)}")
+            print(f"地区数量: {group_df['pac'].nunique()}")
+            print(f"年份分布:\n{group_df['Year'].value_counts().sort_index()}")
+
+            for dep_var in ['LA65', 'LA85']:
+                print(f"\n因变量: {dep_var}")
+
+                indep_vars = SELECTED_VARS[group_name][dep_var]
+
+                missing_vars = [var for var in indep_vars if var not in group_df.columns]
+                if missing_vars:
+                    print(f"  警告: 以下变量不存在，已移除: {missing_vars}")
+                    indep_vars = [var for var in indep_vars if var in group_df.columns]
+
+                print(f"  自变量: {indep_vars}")
+
+                vif_data, high_vif_vars = check_vif_without_time(group_df, indep_vars)
+
+                if not vif_data.empty:
+                    vif_data['Group'] = group_name
+                    vif_data['Dependent_Variable'] = dep_var
+                    vif_results.append(vif_data)
+
+                print(f"  运行个体效应+时间趋势模型（主模型）...")
+                results_entity_trend, extended_vars = run_entity_effects_with_time_trend(
+                    group_df, group_name, dep_var, indep_vars
+                )
+
+                print(f"  运行一阶差分模型（稳健性检验）...")
+                results_first_diff = run_first_difference_model(group_df, group_name, dep_var, indep_vars)
+
+                if results_entity_trend is not None:
+                    result_df = format_results_summary(
+                        results_entity_trend,
+                        '个体效应+时间趋势',
+                        group_name,
+                        dep_var
+                    )
+
+                    if result_df is not None:
+                        all_results.append(result_df)
+
+                        time_trend_row = result_df[result_df['Variable'] == 'time_trend']
+                        time_coef = time_trend_row.iloc[0]['Coefficient'] if not time_trend_row.empty else None
+                        time_pval = time_trend_row.iloc[0]['P_Value'] if not time_trend_row.empty else None
+
+                        comparison_info = {
+                            'Group': group_name,
+                            'Dependent_Variable': dep_var,
+                            'Model_Type': '个体效应+时间趋势',
+                            'R_squared': results_entity_trend.rsquared,
+                            'R_squared_within': results_entity_trend.rsquared_within,
+                            'N_obs': results_entity_trend.nobs,
+                            'Time_Trend_Coefficient': time_coef,
+                            'Time_Trend_PValue': time_pval
+                        }
+                        model_comparisons.append(comparison_info)
+
+                        print(f"    主模型结果:")
+                        print(f"      R² = {results_entity_trend.rsquared:.4f}")
+                        print(f"      组内R² = {results_entity_trend.rsquared_within:.4f}")
+                        print(f"      观测值 = {results_entity_trend.nobs}")
+
+                        if time_coef is not None:
+                            sig = time_trend_row.iloc[0]['Significance']
+                            print(f"      时间趋势系数: {time_coef:.4f} {sig} (p={time_pval:.4f})")
+
+                if results_first_diff is not None:
+                    result_df = format_results_summary(
+                        results_first_diff,
+                        '一阶差分',
+                        group_name,
+                        dep_var
+                    )
+
+                    if result_df is not None:
+                        all_results.append(result_df)
+
+                        const_row = result_df[result_df['Variable'] == 'const']
+                        const_coef = const_row.iloc[0]['Coefficient'] if not const_row.empty else None
+                        const_pval = const_row.iloc[0]['P_Value'] if not const_row.empty else None
+
+                        comparison_info = {
+                            'Group': group_name,
+                            'Dependent_Variable': dep_var,
+                            'Model_Type': '一阶差分',
+                            'R_squared': results_first_diff.rsquared,
+                            'R_squared_within': results_first_diff.rsquared_within,
+                            'N_obs': results_first_diff.nobs,
+                            'Time_Trend_Coefficient': const_coef,
+                            'Time_Trend_PValue': const_pval
+                        }
+                        model_comparisons.append(comparison_info)
+
+                        print(f"    一阶差分模型结果:")
+                        print(f"      R² = {results_first_diff.rsquared:.4f}")
+                        print(f"      观测值 = {results_first_diff.nobs}")
+
+                        if const_coef is not None:
+                            sig = const_row.iloc[0]['Significance']
+                            print(f"      常数项(时间趋势): {const_coef:.4f} {sig} (p={const_pval:.4f})")
+
+                if results_entity_trend is not None and results_first_diff is not None:
+                    print(f"    模型系数比较:")
+
+                    main_coefs = {}
+                    main_results_df = format_results_summary(results_entity_trend, '', group_name, dep_var)
+                    for _, row in main_results_df.iterrows():
+                        if row['Variable'] != 'const' and row['Variable'] != 'time_trend' and not row[
+                            'Variable'].startswith('diff_'):
+                            main_coefs[row['Variable']] = row['Coefficient']
+
+                    diff_coefs = {}
+                    diff_results_df = format_results_summary(results_first_diff, '', group_name, dep_var)
+                    for _, row in diff_results_df.iterrows():
+                        if row['Variable'].startswith('diff_') and row['Variable'] != 'const':
+
+                            orig_var = row['Variable'][5:]
+                            diff_coefs[orig_var] = row['Coefficient']
+
+                    common_vars = set(main_coefs.keys()) & set(diff_coefs.keys())
+                    for var in common_vars:
+                        main_coef = main_coefs[var]
+                        diff_coef = diff_coefs[var]
+
+                        if main_coef != 0:
+                            diff_pct = abs((main_coef - diff_coef) / main_coef * 100)
+                            if diff_pct > 20:
+                                print(
+                                    f"      {var}: 主模型={main_coef:.4f}, 差分模型={diff_coef:.4f}, 差异较大({diff_pct:.1f}%)")
+                            else:
+                                print(
+                                    f"      {var}: 主模型={main_coef:.4f}, 差分模型={diff_coef:.4f}, 差异较小({diff_pct:.1f}%)")
+
+        if all_results:
+            summary_df = pd.concat(all_results, ignore_index=True)
+            summary_df.to_excel(writer, sheet_name='汇总结果', index=False)
+            print(f"\n汇总结果已保存，包含{len(summary_df)}行记录")
+
+        if model_comparisons:
+            comparison_df = pd.DataFrame(model_comparisons)
+            comparison_df.to_excel(writer, sheet_name='模型比较', index=False)
+            print(f"模型比较结果已保存，包含{len(comparison_df)}个模型")
+
+        if vif_results:
+            vif_summary_df = pd.concat(vif_results, ignore_index=True)
+            vif_summary_df.to_excel(writer, sheet_name='VIF检验', index=False)
+            print(f"VIF检验结果已保存")
+
+        group_stats = df.groupby('Urbanization_Group').agg({
+            'pac': 'nunique',
+            'Year': lambda x: sorted(x.unique())
+        }).reset_index()
+        group_stats.columns = ['Urbanization_Group', 'N_Regions', 'Years']
+        group_stats.to_excel(writer, sheet_name='分组统计', index=False)
+
+        time_trend_info = pd.DataFrame({
+            'Year': sorted(df['Year'].unique()),
+            'Time_Trend_Value': range(len(sorted(df['Year'].unique())))
+        })
+        time_trend_info.to_excel(writer, sheet_name='时间趋势编码', index=False)
+
+        method_desc = pd.DataFrame({
+            '方法': ['个体效应+时间趋势', '一阶差分'],
+            '适用条件': ['两年面板数据', '两年面板数据'],
+            '数学等价性': ['是', '是'],
+            '优点': ['直接解释时间趋势系数', '直观反映10年间变化'],
+            '备注': ['主模型', '稳健性检验']
+        })
+        method_desc.to_excel(writer, sheet_name='方法说明', index=False)
+
+    print(f"\n{'=' * 60}")
+    print("分析完成！")
+    print(f"结果已保存至: {RESULT_PATH}")
+    print(f"{'=' * 60}")
+    print("\n关键建议:")
+    print("1. 主模型: 个体效应+时间趋势")
+    print("2. 稳健性检验: 一阶差分模型")
+    print("3. 两年数据中，两个模型数学等价，结果应基本一致")
+    print("4. 时间趋势系数反映了2010-2020年间的整体变化")
+
+
+if __name__ == "__main__":
+    main()
