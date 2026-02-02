@@ -1,0 +1,392 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.experimental import enable_iterative_imputer
+from sklearn.impute import IterativeImputer
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+from scipy.stats import spearmanr
+import warnings
+import os
+
+warnings.filterwarnings('ignore')
+
+DATA_PATH = 'C:/……'
+SAVE_IMPORTANCE_PATH = 'C:/……'
+SAVE_PLOT_PATH = 'C:/……'
+SAVE_VALIDATION_SUMMARY = 'C:/……'
+
+os.makedirs(SAVE_PLOT_PATH, exist_ok=True)
+
+ID_VARS = ['pac', 'Year', 'Urb']
+TARGET_VARS = ['LA65', 'LA85']
+URBAN_GROUPS = ['低城市化组', '中城市化组', '高城市化组']
+QUANTILE_THRESHOLD = 0.01
+
+GROUP_FEATURES_CONFIG = {
+    '低城市化组_LA65': [……],
+    '低城市化组_LA85': [……],
+    '中城市化组_LA65': [……],
+    '中城市化组_LA85': [……],
+    '高城市化组_LA65': [……],
+    '高城市化组_LA85': [……]
+}
+
+GROUP_STRICT_PARAMS = {
+    '低城市化组': {
+        'n_estimators': 200,
+        'max_depth': 9,  
+        'min_samples_split': 12,  
+        'min_samples_leaf': 6,  
+        'max_features': 'sqrt',  
+        'random_state': 42,
+        'n_jobs': -1,
+        'oob_score': True
+    },
+    '中城市化组': {
+        'n_estimators': 200,
+        'max_depth': 9,  
+        'min_samples_split': 15,  
+        'min_samples_leaf': 8,  
+        'max_features': 0.7,  
+        'random_state': 42,
+        'n_jobs': -1,
+        'oob_score': True
+    },
+    '高城市化组': {
+        'n_estimators': 200,
+        'max_depth': 10,  
+        'min_samples_split': 10,  
+        'min_samples_leaf': 5,  
+        'max_features': 'sqrt',  
+        'random_state': 42,
+        'n_jobs': -1,
+        'oob_score': True
+    }
+}
+
+REPEAT_TIMES = 3
+RANDOM_SEEDS = [42, 123, 456]
+MIN_TRAIN_R2 = 0.7
+
+def load_data(path):
+
+    df = pd.read_excel(path)
+    print(f"原始数据列名: {df.columns.tolist()}")
+    print(f"检查是否有'Urb'列: {'Urb' in df.columns}")
+
+    if 'Urb' in df.columns:
+        df['Urb_Group'] = pd.cut(df['Urb'], bins=[-1, 3, 7, 10], labels=URBAN_GROUPS)
+        print(f"城市化分组创建完成，各组样本量:")
+        print(df['Urb_Group'].value_counts())
+    else:
+        print("错误：数据中没有'Urb'列")
+        possible_cols = [col for col in df.columns if 'urb' in col.lower() or '城市化' in col]
+        if possible_cols:
+            print(f"找到可能的列: {possible_cols}")
+            df['Urb_Group'] = pd.cut(df[possible_cols[0]], bins=[-1, 3, 7, 10], labels=URBAN_GROUPS)
+        else:
+            raise KeyError("数据中没有找到城市化相关的列")
+
+    all_possible_features = list(set(sum(GROUP_FEATURES_CONFIG.values(), [])))
+    all_needed_cols = ID_VARS + TARGET_VARS + all_possible_features + ['Urb_Group']
+    existing_cols = [col for col in all_needed_cols if col in df.columns]
+    df = df[existing_cols]
+
+    print(f"合并数据加载完成：共{len(df)}行，{len(df.columns)}列")
+    return df
+
+
+def handle_outliers(df, features, group_col='Urb_Group', quantile=0.01):
+    df_out = df.copy()
+    if group_col not in df_out.columns:
+        print(f"警告：数据中没有'{group_col}'列，跳过分组处理")
+        return df_out
+
+    for group in df_out[group_col].unique():
+        if pd.isna(group):
+            continue
+        group_mask = df_out[group_col] == group
+        for feat in features:
+            if feat not in df_out.columns:
+                continue
+            group_data = df_out.loc[group_mask, feat]
+            if len(group_data) > 0:
+                lower = group_data.quantile(quantile)
+                upper = group_data.quantile(1 - quantile)
+                df_out.loc[group_mask, feat] = group_data.clip(lower=lower, upper=upper)
+    print(f"极端值缩尾处理完成（特征数：{len(features)}）")
+    return df_out
+
+
+def impute_missing(df, features):
+    numeric_features = [f for f in features if f in df.columns and pd.api.types.is_numeric_dtype(df[f])]
+    if len(numeric_features) == 0:
+        print("警告：没有找到数值型特征进行插补")
+        return df
+
+    imputer = IterativeImputer(random_state=42, max_iter=10)
+    df_imputed = df.copy()
+    df_imputed[numeric_features] = imputer.fit_transform(df_imputed[numeric_features])
+    print(f"缺失值迭代插补完成，处理了{len(numeric_features)}个特征")
+    return df_imputed
+
+
+def calculate_fitting_metrics(model, X, y):
+    y_pred = model.predict(X)
+    r2 = np.round(r2_score(y, y_pred), 4).item()
+    if r2 < MIN_TRAIN_R2:
+        print(f"⚠️ 训练集R²={r2}＜{MIN_TRAIN_R2}，需微调参数")
+    mae = np.round(mean_absolute_error(y, y_pred), 4).item()
+    mse = np.round(mean_squared_error(y, y_pred), 4).item()
+    return {'训练集R²': r2, 'MAE': mae, 'MSE': mse}
+
+def calculate_importance_consistency(X, y, features, group, n_repeats=REPEAT_TIMES, seeds=RANDOM_SEEDS):
+    importance_rank_list = []
+    for seed in seeds:
+        params = GROUP_STRICT_PARAMS[group].copy()
+        params['random_state'] = seed
+        rf = RandomForestRegressor(**params)
+        rf.fit(X, y)
+        imp_df = pd.DataFrame({'变量名': features, '重要性': rf.feature_importances_})
+        imp_df = imp_df.sort_values('重要性', ascending=False).reset_index(drop=True)
+        importance_rank_list.append(imp_df['变量名'].tolist())
+
+    consistency_scores = []
+    for i in range(n_repeats):
+        for j in range(i + 1, n_repeats):
+            rank_i = pd.Series(range(1, len(features) + 1), index=importance_rank_list[i])
+            rank_j = pd.Series(range(1, len(features) + 1), index=importance_rank_list[j])
+
+            rank_i_vals = rank_i[features].values
+            rank_j_vals = rank_j[features].values
+            valid_mask = ~(np.isnan(rank_i_vals) | np.isnan(rank_j_vals))
+
+            if not np.any(valid_mask):
+                corr = np.nan
+            else:
+                res = spearmanr(rank_i_vals[valid_mask], rank_j_vals[valid_mask])
+                corr = res.statistic
+
+            consistency_scores.append(np.round(corr, 4).item() if not np.isnan(corr) else np.nan)
+
+    valid_scores = [s for s in consistency_scores if not np.isnan(s)]
+    avg_consistency = np.round(np.mean(valid_scores), 4).item() if valid_scores else np.nan
+    return {'重要性排序一致性（平均Spearman）': avg_consistency}
+
+def adjust_params_for_overfitting(X, y, group, features):
+    strict_params = GROUP_STRICT_PARAMS[group].copy()
+    rf_strict = RandomForestRegressor(**strict_params)
+    rf_strict.fit(X, y)
+
+    train_metrics = calculate_fitting_metrics(rf_strict, X, y)
+    train_r2 = train_metrics['训练集R²']
+    oob_r2 = np.round(rf_strict.oob_score_, 4) if hasattr(rf_strict, 'oob_score_') else 0
+    overfit_gap = np.round(train_r2 - oob_r2, 4)
+
+    print(f"🔍 {group}初始严格参数：训练集R²={train_r2}，OOB-R²={oob_r2}，过拟合差值={overfit_gap}")
+
+    if train_r2 >= MIN_TRAIN_R2:
+        print(f"✅ {group}严格参数满足训练集R²≥{MIN_TRAIN_R2}，使用该参数降过拟合")
+        return strict_params, rf_strict, overfit_gap
+
+    relax_steps = [
+        {'min_samples_split': strict_params['min_samples_split'] - 3,
+         'min_samples_leaf': strict_params['min_samples_leaf'] - 2},
+        {'max_depth': strict_params['max_depth'] + 1, 'min_samples_split': strict_params['min_samples_split'] - 4},
+        {'max_depth': strict_params['max_depth'] + 2, 'min_samples_leaf': strict_params['min_samples_leaf'] - 3}
+    ]
+
+    final_params = strict_params.copy()
+    final_rf = rf_strict
+    final_gap = overfit_gap
+
+    for step, relax in enumerate(relax_steps):
+        temp_params = strict_params.copy()
+        temp_params.update(relax)
+        temp_params['min_samples_split'] = max(5, temp_params['min_samples_split'])
+        temp_params['min_samples_leaf'] = max(2, temp_params['min_samples_leaf'])
+        temp_params['max_depth'] = min(12, temp_params['max_depth'])
+
+        rf_temp = RandomForestRegressor(**temp_params)
+        rf_temp.fit(X, y)
+        temp_train_metrics = calculate_fitting_metrics(rf_temp, X, y)
+        temp_train_r2 = temp_train_metrics['训练集R²']
+        temp_oob_r2 = np.round(rf_temp.oob_score_, 4) if hasattr(rf_temp, 'oob_score_') else 0
+        temp_gap = np.round(temp_train_r2 - temp_oob_r2, 4)
+
+        print(f"🔧 {group}放宽步骤{step + 1}：参数{relax} → 训练集R²={temp_train_r2}，过拟合差值={temp_gap}")
+
+        if temp_train_r2 >= MIN_TRAIN_R2:
+            final_params = temp_params
+            final_rf = rf_temp
+            final_gap = temp_gap
+            print(f"✅ {group}放宽后训练集R²≥{MIN_TRAIN_R2}，过拟合差值={temp_gap}")
+            break
+
+    return final_params, final_rf, final_gap
+
+def filter_features_by_importance(X, y, features, strat_key, min_importance_threshold=0.02):
+    if "低城市化组" in strat_key:
+        threshold = 0.01
+    elif "LA65" in strat_key and ("中城市化组" in strat_key or "高城市化组" in strat_key):
+        threshold = 0.02
+    else:
+        threshold = 0.015
+
+    temp_rf = RandomForestRegressor(**GROUP_STRICT_PARAMS[strat_key.split('_')[0]])
+    temp_rf.fit(X, y)
+    imp_df = pd.DataFrame({
+        '变量名': features,
+        '重要性': temp_rf.feature_importances_,
+        '重要性占比(%)': temp_rf.feature_importances_ * 100
+    })
+
+    must_keep_features = ['PM25', 'Medical_personnel', 'Resident_savings', 'GDP']
+    must_keep = imp_df[imp_df['变量名'].isin(must_keep_features)]['变量名'].tolist()
+    filter_imp = imp_df[imp_df['重要性'] >= threshold]['变量名'].tolist()
+    final_features = list(set(filter_imp + must_keep))
+    final_features = [f for f in final_features if f in X.columns]
+
+    if len(final_features) < 3:
+        final_features = available_features[:5]
+        print(f"⚠️ {strat_key}筛选后特征过少，兜底保留{len(final_features)}个")
+
+    print(f"🔍 {strat_key}变量筛选：原始{len(features)}个 → 筛选后{len(final_features)}个（阈值{threshold * 100}%）")
+    return final_features, imp_df
+
+def train_stratified_rf_with_validation(df, target, group_col='Urb_Group'):
+    all_importance = []
+    validation_summary = []
+
+    for group in URBAN_GROUPS:
+        strat_key = f"{group}_{target}"
+        if strat_key not in GROUP_FEATURES_CONFIG:
+            print(f"⚠️ 分层{strat_key}无特征配置，跳过")
+            continue
+
+        strat_features = GROUP_FEATURES_CONFIG[strat_key]
+        available_features = [f for f in strat_features if f in df.columns]
+        if len(available_features) == 0:
+            print(f"⚠️ {strat_key}没有可用的特征列，跳过")
+            continue
+
+        group_data = df[df[group_col] == group].copy()
+        if len(group_data) < 30:
+            print(f"⚠️ {strat_key}样本量不足{len(group_data)}，跳过")
+            continue
+        group_data = handle_outliers(group_data, available_features)
+        group_data = impute_missing(group_data, available_features)
+
+        filtered_features, imp_df_temp = filter_features_by_importance(
+            group_data[available_features], group_data[target], available_features, strat_key
+        )
+        X = group_data[filtered_features].copy()
+        y = group_data[target].copy()
+
+        final_params, rf_main, overfit_gap = adjust_params_for_overfitting(X, y, group, filtered_features)
+
+        oob_r2 = np.round(rf_main.oob_score_, 4).item() if (
+                hasattr(rf_main, 'oob_score_') and not np.isnan(rf_main.oob_score_)) else np.nan
+        fitting_metrics = calculate_fitting_metrics(rf_main, X, y)
+        consistency_metrics = calculate_importance_consistency(X, y, filtered_features, group)
+
+        imp_df = pd.DataFrame({
+            '分层': strat_key,
+            '城市化分组': group,
+            '因变量': target,
+            '变量名': filtered_features,
+            '变量重要性': rf_main.feature_importances_,
+            '重要性占比(%)': np.round(rf_main.feature_importances_ * 100, 2),
+            'OOB-R²': oob_r2,
+            '训练集R²': fitting_metrics['训练集R²'],
+            '过拟合差值': overfit_gap,
+            'MAE': fitting_metrics['MAE'],
+            '使用参数': str(final_params)
+        })
+        imp_df = imp_df.sort_values('变量重要性', ascending=False).reset_index(drop=True)
+        all_importance.append(imp_df)
+
+        val_summary = {
+            '分层': strat_key,
+            '城市化分组': group,
+            '因变量': target,
+            '样本量': len(group_data),
+            '使用特征数': len(filtered_features),
+            'OOB-R²': oob_r2,
+            '训练集R²': fitting_metrics['训练集R²'],
+            '过拟合差值': overfit_gap,
+            'MAE': fitting_metrics['MAE'],
+            'MSE': fitting_metrics['MSE'],
+            '变量重要性排序一致性（平均Spearman）': consistency_metrics['重要性排序一致性（平均Spearman）'],
+            '最终使用参数': str(final_params)
+        }
+        validation_summary.append(val_summary)
+
+        plot_top_importance(imp_df.head(15), strat_key, target)
+        print(
+            f"✅ {strat_key}训练完成：训练集R²={fitting_metrics['训练集R²']}，OOB-R²={oob_r2}，过拟合差值={overfit_gap}")
+
+    return pd.concat(all_importance, ignore_index=True) if all_importance else pd.DataFrame(), \
+        pd.DataFrame(validation_summary) if validation_summary else pd.DataFrame()
+
+
+def plot_top_importance(importance, strat_key, target):
+
+    plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
+    plt.figure(figsize=(12, 8))
+    bars = plt.barh(importance['变量名'][::-1], importance['重要性占比(%)'][::-1], color='#1f77b4')
+    for bar in bars:
+        width = bar.get_width()
+        plt.text(width + 0.1, bar.get_y() + bar.get_height() / 2,
+                 f'{width:.1f}%', ha='left', va='center', fontsize=9)
+    plt.title(f'Variable Importance (Merged Data) - {strat_key}', fontsize=14, fontweight='bold')
+    plt.xlabel('Importance (%)', fontsize=12)
+    plt.ylabel('Variables', fontsize=12)
+    plt.tight_layout()
+
+    safe_strat = strat_key.replace('/', '_').replace('\\', '_').replace(' ', '_')
+    safe_target = target.replace('/', '_').replace('\\', '_')
+    filename = f'{SAVE_PLOT_PATH}{safe_strat}_importance.png'
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"图表已保存: {filename}")
+
+def main_stratified_rf():
+    df = load_data(DATA_PATH)
+    print(f"\n数据概览: {df.shape}")
+
+    all_importance = []
+    all_validation = []
+
+    for target in TARGET_VARS:
+        print(f"\n=== 开始处理因变量：{target} ===")
+        if target not in df.columns:
+            print(f"⚠️ 目标变量{target}不存在，跳过")
+            continue
+        imp_df, val_df = train_stratified_rf_with_validation(df, target)
+        if not imp_df.empty:
+            all_importance.append(imp_df)
+        if not val_df.empty:
+            all_validation.append(val_df)
+
+    if all_importance:
+        final_importance = pd.concat(all_importance, ignore_index=True)
+        final_importance.to_excel(SAVE_IMPORTANCE_PATH, index=False)
+        print(f"\n🎉 合并数据变量重要性结果已保存至：{SAVE_IMPORTANCE_PATH}")
+    else:
+        print("\n⚠️ 没有生成变量重要性结果")
+
+    if all_validation:
+        final_validation = pd.concat(all_validation, ignore_index=True)
+        final_validation.to_excel(SAVE_VALIDATION_SUMMARY, index=False)
+        print(f"🎉 合并数据模型验证汇总表已保存至：{SAVE_VALIDATION_SUMMARY}")
+        print("\n=== 模型验证汇总预览（重点看：过拟合差值）===")
+        print(final_validation[['分层', '样本量', '使用特征数', 'OOB-R²', '训练集R²',
+                                '过拟合差值', '变量重要性排序一致性（平均Spearman）']].head())
+    else:
+        print("\n⚠️ 未生成模型验证汇总表")
+
+
+if __name__ == '__main__':
+    main_stratified_rf()
